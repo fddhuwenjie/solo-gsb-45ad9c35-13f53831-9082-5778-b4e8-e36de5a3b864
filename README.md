@@ -28,7 +28,7 @@ python3 main.py
 数据持久化在 SQLite（容器内 `/data/app.db`，本地默认 `./data/app.db`，
 环境变量 `APP_DB` 可改）。
 
-自检（启动临时实例跑 434 项端到端检查）：
+自检（启动临时实例跑 486 项端到端检查）：
 
 ```bash
 python3 tests/selftest.py
@@ -55,6 +55,8 @@ python3 tests/selftest.py
 | POST | `/v1/assessments/{id}/responsibility-plan` | 义务责任分工（执行/复核） |
 | POST | `/v1/assessments/{id}/remediation-plan` | 冲突核算的组件许可证整改规划 |
 | POST | `/v1/assessments/compare` | 两次核算的原子差异与最小归因对比 |
+| POST | `/v1/release-batches` | 登记不可变许可证发布批次（按 `batch_id` 幂等） |
+| GET | `/v1/release-batches/{batch_id}` | 读取已登记批次的冻结清单与 `batch_hash` |
 
 ### 不可变修订与原子发布（含并发发布与回滚）
 
@@ -1018,6 +1020,163 @@ curl -sS -X POST "$BASE/v1/assessments/compare" \
   -d "{\"baseline_id\": \"$BASE_ID\", \"target_id\": \"$TARGET_ID\"}"
 ```
 
+### 不可变发布批次 `POST /v1/release-batches`
+
+把 1～50 个**已持久化的放行核算**（`status: "ok"`）登记为一个不可变的
+许可证发布批次。请求带调用方自管、唯一的 `batch_id`，并逐项列出每个核算
+要发布的制品（组件）标识、版本与依赖关系：
+
+```json
+{
+  "batch_id": "release-2026-10-01-001",
+  "assessments": [
+    {
+      "assessment_id": "45c9821d…",
+      "artifacts": [
+        {"id": "gateway", "version": "4.2.0", "dependencies": ["crypto", "sqlite"]},
+        {"id": "crypto",  "version": "1.9",   "dependencies": []},
+        {"id": "sqlite",  "version": "3.45",  "dependencies": []}
+      ]
+    },
+    {
+      "assessment_id": "9be1042a…",
+      "artifacts": [
+        {"id": "gateway", "version": "4.2.0", "dependencies": ["other"]},
+        {"id": "other",   "version": "1.0",   "dependencies": []}
+      ]
+    }
+  ]
+}
+```
+
+- `batch_id`：1～128 个 URL 安全字符（字母、数字与 `. _ - : / ~`），在全部
+  批次中唯一；可用发布工单号、UUID 等。
+- `assessments[]`：1～50 项，核算 id 不得重复；每项的 `artifacts[]` 非空。
+- `artifacts[].id`：该核算中的组件 id；`version` 必须与核算持久化快照中的
+  组件版本逐字一致（可省略，等同空串）；`dependencies` 必须与快照中该组件
+  的出边依赖集合**完全一致**（重复/乱序会被规范化）。声明集合必须**恰好
+  覆盖**该核算的全部组件——多报（核算中不存在的组件）或少报都会被拒。
+
+服务在**同一个 SQLite 事务**（`BEGIN IMMEDIATE`）内完成全部前置核验：
+
+1. 每个核算都存在（`assessment-not-found`）；
+2. 每个核算状态都是 `ok`（`assessment-not-ok`）；
+3. 对命名规则集的核算，事务内**读取并锁定其记录的不可变规则修订**，并核对
+   评估持久化的规则快照与该修订内容逐字节一致；快照无法核验（规则修订已
+   不存在、旧库记录无法证明原规则等）返回 `rules-snapshot-unverifiable`；
+   内联规则核算使用其自带的持久化快照；
+4. 逐项核验制品声明（`artifact-unknown` / `artifact-incomplete` /
+   `artifact-version-mismatch` / `artifact-dependency-mismatch`）；
+5. 拒绝重复制品（同一核算内重复列出同一制品：`duplicate-artifact`），
+   以及同一组件在不同核算中**名称、版本或采用许可证不一致**
+   （`component-mismatch`，响应逐项给出冲突字段、双方核算 id 与取值）。
+
+**任一前置失败，整体返回 409（状态冲突类）或 422（内容语义类），事务回滚，
+绝不写部分记录。**
+
+全部通过后按确定性顺序合并：同一组件 id（即使来自多个核算）去重为一条
+制品记录，`dependencies` 与该组件的义务列表取各核算之**并集**，
+`assessments` 列出贡献该制品的核算；同时返回每个核算的规则集、规则修订、
+`summary_hash` 与其贡献的制品。清单全部按 id 排序，`batch_hash` 是
+**规范化清单内容（不含 `batch_id` 与哈希字段本身）**的 SHA-256——请求中
+核算与制品的顺序、依赖的顺序都不改变 `batch_hash`；内容相同的两个批次
+（即使 `batch_id` 不同）哈希一致。
+
+```json
+{
+  "batch_id": "release-2026-10-01-001",
+  "created": true,
+  "created_at": "2026-10-01T10:00:00+00:00",
+  "artifact_count": 4,
+  "assessment_count": 2,
+  "artifacts": [
+    {"id": "crypto", "name": "CryptoLib", "version": "1.9",
+     "license": "Apache-2.0 AND MIT",
+     "obligations": ["attribution", "license-text", "notice-preserve"],
+     "dependencies": [], "assessments": ["45c9821d…"]},
+    {"id": "gateway", "name": "Gateway", "version": "4.2.0",
+     "license": "Apache-2.0",
+     "obligations": ["attribution", "license-text", "notice-preserve"],
+     "dependencies": ["crypto", "other", "sqlite"],
+     "assessments": ["45c9821d…", "9be1042a…"]}
+  ],
+  "assessments": [
+    {"assessment_id": "45c9821d…", "ruleset": "default",
+     "ruleset_revision": "9f12d4f1324eaea3",
+     "summary_hash": "5b4d6f10…",
+     "artifacts": ["crypto", "gateway", "sqlite"]}
+  ],
+  "batch_hash": "c8557aae…"
+}
+```
+
+**幂等**：用同一 `batch_id` 重复登记，只有当重新合并得到的内容与已登记
+快照**完全一致**（`batch_hash` 相同）时才成功，返回 `"created": false` 与
+冻结清单；`batch_id` 被不同内容复用返回 **409**（`reason:
+"batch-id-conflict"`，附双方哈希），原批次不被覆盖。
+
+**不可变**：清单与每个核算的完整规则快照都在登记事务中落库；此后规则集
+发布新修订、同名规则集被覆盖，都不会改变已登记批次（GET 始终返回登记时
+的义务、许可证与修订出处）。同一批次允许混合绑定不同规则修订的核算，
+每项核算在 `assessments[].ruleset_revision` 中各自留痕。
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 先有若干放行核算（此处复用 /v1/assessments 的 id）
+ID1=$(curl -sS -X POST "$BASE/v1/assessments" -H 'Content-Type: application/json' -d '{
+  "product": "edge-gateway",
+  "components": [
+    {"id": "gateway", "name": "Gateway", "version": "4.2.0", "license": "Apache-2.0"},
+    {"id": "sqlite",  "name": "SQLite",  "version": "3.45",  "license": "Unlicense"}
+  ],
+  "dependencies": [{"from": "gateway", "to": "sqlite"}]
+}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+
+# 2) 登记发布批次（制品/版本/依赖必须与快照一致）
+curl -sS -X POST "$BASE/v1/release-batches" \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"batch_id\": \"release-2026-10-01-001\",
+    \"assessments\": [{
+      \"assessment_id\": \"$ID1\",
+      \"artifacts\": [
+        {\"id\": \"gateway\", \"version\": \"4.2.0\", \"dependencies\": [\"sqlite\"]},
+        {\"id\": \"sqlite\",  \"version\": \"3.45\",  \"dependencies\": []}
+      ]
+    }]
+  }" | python3 -m json.tool
+
+# 3) 幂等重试（相同内容 -> 200, created=false；内容不同 -> 409）
+curl -sS -X POST "$BASE/v1/release-batches" -H 'Content-Type: application/json' \
+  -d "{\"batch_id\": \"release-2026-10-01-001\",
+       \"assessments\": [{\"assessment_id\": \"$ID1\", \"artifacts\": [
+         {\"id\": \"sqlite\",  \"version\": \"3.45\"},
+         {\"id\": \"gateway\", \"version\": \"4.2.0\", \"dependencies\": [\"sqlite\"]}
+       ]}]}"
+
+# 4) 随时取回冻结清单（不受后续规则发布影响）
+curl -sS "$BASE/v1/release-batches/release-2026-10-01-001"
+```
+
+```bash
+# 核算不存在 / 非 ok / 快照无法核验 -> 整体 409，无部分记录
+# 409 {"reason": "assessment-not-found", "assessment_ids": ["…"]}
+# 409 {"reason": "assessment-not-ok", "assessment_id": "…", "status": "conflict"}
+# 409 {"reason": "rules-snapshot-unverifiable", "assessment_id": "…"}
+
+# 重复制品 / 跨核算名称·版本·许可证不一致 / 声明与快照不符 -> 整体 422
+# 422 {"reason": "duplicate-artifact", "assessment_id": "…", "artifact_id": "…"}
+# 422 {"reason": "component-mismatch", "conflicts": [
+#        {"artifact_id": "gateway", "field": "version",
+#         "first_assessment_id": "…", "existing_value": "4.2.0",
+#         "assessment_id": "…", "conflicting_value": "4.3.0"}]}
+```
+
+信封错误（非对象、`batch_id` 缺失或含非法字符、`assessments` 为空/超过
+50 项、核算 id 重复、`artifacts` 为空、字段类型错误等）返回 **400**，
+与数据库状态无关。批次不存在时 GET 返回 **404**。
+
 ## 语义模型
 
 **表达式**：`AND` / `OR` / `WITH`、括号、许可证 id（含 `+` 后缀与
@@ -1090,9 +1249,10 @@ app/schedule.py       义务截止日排期：RFC 3339/IANA 时区解析、日�
 app/responsibility.py 责任分工：责任项展开（制品级/组件级）、人员资格/容量/成本规范化、全局最优分工（穷举 + 最小费用流界的完备分支定界）、409 最佳部分方案与原因
 app/remediation.py   许可证整改：候选表达式/成本校验（非法整体 422）、在持久化快照上重算的全局最优异构组合（穷举 + 完备分支定界，精确有理数成本）、放行方案与 409 唯一最佳失败方案
 app/compare.py        核算对比：原子差异分解（稳定编号）、反事实回滚与全局最小归因集（按大小递增、ID 字典序完备枚举，非法中间状态不计命中）
-app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、影响审查的单读事务前置条件核验
+app/batches.py        不可变发布批次：信封校验、按快照核验制品声明、跨核算共享组件去重与义务/依赖合并（名称·版本·许可证一致性）、稳定 batch_hash
+app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、影响审查的单读事务前置条件核验、发布批次的单事务登记与冻结
 app/server.py         ThreadingHTTPServer JSON 路由
-tests/selftest.py     434 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查）
+tests/selftest.py     486 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次）
 Dockerfile / docker-compose.yml / .dockerignore
 ```
 

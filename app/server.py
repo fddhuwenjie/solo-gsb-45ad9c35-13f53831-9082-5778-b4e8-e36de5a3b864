@@ -19,6 +19,9 @@ Endpoints:
     POST /v1/assessments/{id}/responsibility-plan
     POST /v1/assessments/{id}/remediation-plan
     POST /v1/assessments/compare
+    POST /v1/release-batches
+         (register an immutable license release batch; idempotent by batch_id)
+    GET  /v1/release-batches/{batch_id}
 """
 
 import json
@@ -28,9 +31,10 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from .common import ClientError, ConflictError, NotFound, stable_hash
+from .common import ClientError, ConflictError, NotFound, UnprocessableError, stable_hash
+from .batches import validate_batch_body
 from .compare import compare_assessments
-from .fulfillment import UnprocessableError, check_fulfillment
+from .fulfillment import check_fulfillment
 from .remediation import RemediationConflict, plan_remediation
 from .responsibility import PartialPlanError, build_plan
 from .revisions import REVISION_ID_LEN
@@ -49,6 +53,9 @@ _ASSESS_RE = re.compile(
     r"^/v1/assessments(?:/([0-9a-f]{8,64})"
     r"(/(?:confirm|confirmation|fulfillment-check|obligation-schedule"
     r"|responsibility-plan|remediation-plan))?)?$"
+)
+_RELEASE_BATCH_RE = re.compile(
+    r"^/v1/release-batches(?:/([A-Za-z0-9._:/~-]{1,128}))?$"
 )
 
 
@@ -352,6 +359,32 @@ class Api:
             raise ConflictError("cannot compare assessment %r: %s" % (aid, reason))
         return row
 
+    # -- release batches ----------------------------------------------------
+
+    def register_release_batch(self, body):
+        """Register (or idempotently re-register) an immutable release batch.
+
+        Envelope validation happens here (400/422 before any state is
+        touched); every stateful precondition -- existing ``ok``
+        assessments, locked and verified rule revisions, cross-assessment
+        artifact consistency -- is confirmed by the store inside one
+        SQLite transaction, which either persists the whole frozen
+        manifest or writes nothing.
+        """
+        batch_id, entries = validate_batch_body(body)
+        out = self.store.register_release_batch(batch_id, entries)
+        return {
+            "created": out["created"],
+            "created_at": out["created_at"],
+            **out["manifest"],
+        }
+
+    def get_release_batch(self, batch_id):
+        out = self.store.get_release_batch(batch_id)
+        if out is None:
+            raise NotFound("release batch %r not found" % batch_id)
+        return out["manifest"]
+
 
 def make_server(host, port, store):
     api = Api(store)
@@ -428,12 +461,22 @@ def make_server(host, port, store):
                                 "POST /v1/assessments/{id}/responsibility-plan",
                                 "POST /v1/assessments/{id}/remediation-plan",
                                 "POST /v1/assessments/compare",
+                                "POST /v1/release-batches",
+                                "GET  /v1/release-batches/{batch_id}",
                             ],
                         },
                     )
 
                 if method == "POST" and path == "/v1/assessments/compare":
                     return self._json(200, api.compare(self._body()))
+
+                m = _RELEASE_BATCH_RE.match(path)
+                if m:
+                    batch_id = m.group(1)
+                    if method == "POST" and batch_id is None:
+                        return self._json(200, api.register_release_batch(self._body()))
+                    if method == "GET" and batch_id is not None:
+                        return self._json(200, api.get_release_batch(batch_id))
 
                 m = _REVISION_RE.match(path)
                 if m:
@@ -483,7 +526,10 @@ def make_server(host, port, store):
 
                 raise NotFound("no route for %s %s" % (method, path))
             except UnprocessableError as exc:
-                return self._json(422, {"error": str(exc)})
+                payload = {"error": str(exc)}
+                if getattr(exc, "details", None):
+                    payload.update(exc.details)
+                return self._json(422, payload)
             except PartialPlanError as exc:
                 return self._json(409, exc.payload)
             except RemediationConflict as exc:

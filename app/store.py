@@ -14,7 +14,9 @@ from .solver import assess_normalized
 #   0 -- pre-revision databases (rulesets table + optional rules snapshot)
 #   2 -- immutable revisions: ruleset_revisions / ruleset_active /
 #        ruleset_activations and assessments.revision provenance
-SCHEMA_VERSION = 2
+#   3 -- immutable release batches: release_batches /
+#        release_batch_assessments, frozen against later rule publications
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rulesets (
@@ -62,6 +64,25 @@ CREATE TABLE IF NOT EXISTS confirmations (
     body          TEXT NOT NULL,
     created_at    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS release_batches (
+    batch_id     TEXT PRIMARY KEY,
+    manifest     TEXT NOT NULL,
+    batch_hash   TEXT NOT NULL,
+    created      INTEGER NOT NULL,
+    created_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS release_batch_assessments (
+    batch_id      TEXT NOT NULL,
+    assessment_id TEXT NOT NULL,
+    ruleset       TEXT,
+    revision      TEXT,
+    rules         TEXT NOT NULL,
+    seq           INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, assessment_id),
+    FOREIGN KEY (batch_id) REFERENCES release_batches(batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_release_batch_assessments_assessment
+    ON release_batch_assessments(assessment_id);
 """
 
 
@@ -94,7 +115,7 @@ class Store:
     # -- schema migration -------------------------------------------------
 
     def _migrate(self, conn):
-        """Upgrade older databases across two migration steps.
+        """Upgrade older databases across three migration steps.
 
         Step 1 (any database): pin rules snapshots onto legacy assessment
         rows whose original rules can be *proven* identical (see
@@ -106,11 +127,15 @@ class Store:
         PUTs/drafts collapse onto it), and each assessment is stamped with
         the revision of its pinned snapshot whenever it can be derived.
         Neither move loses or rewrites historical content.
+
+        Step 3 (user_version < 3): create the release-batch tables.  No
+        historical content is transformed -- batches only ever *append*.
         """
         self._migrate_assessment_snapshots(conn)
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version < SCHEMA_VERSION:
+        if version < 2:
             self._migrate_revisions(conn)
+        if version < SCHEMA_VERSION:
             conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
 
     def _migrate_assessment_snapshots(self, conn):
@@ -883,3 +908,241 @@ class Store:
         finally:
             conn.close()
         return json.loads(row["body"]) if row else None
+
+    # -- release batches ---------------------------------------------------
+
+    @staticmethod
+    def _snapshot_rules_within(conn, row):
+        """Prove and return an assessment's rules snapshot inside a tx.
+
+        Rows that already carry a pinned ``rules`` snapshot are accepted
+        as-is by the caller; this covers rows without one (pre-upgrade
+        databases): the original rules are returned only when they can be
+        *proven* -- either the named revision the assessment recorded still
+        exists as immutable content, or the legacy ruleset mirror content
+        hashes to the assessment id and a replay reproduces the stored
+        ``summary_hash``.  Anything else yields ``None``; the caller must
+        refuse the batch rather than registering against guessed rules.
+        """
+        request = json.loads(row["request"])
+        stored = json.loads(row["result"])
+        name = row["ruleset"]
+        if name and row["revision"]:
+            rev_row = conn.execute(
+                "SELECT body FROM ruleset_revisions"
+                " WHERE ruleset_name = ? AND revision = ?",
+                (name, row["revision"]),
+            ).fetchone()
+            if rev_row is not None:
+                rules = json.loads(rev_row["body"])
+                if stable_hash({"request": request, "rules": rules})[:32] == row["id"]:
+                    replayed = assess_normalized(request, rules)
+                    if replayed.get("summary_hash") == stored.get("summary_hash"):
+                        return rules
+        rules = Store._verified_legacy_rules(conn, row)
+        return rules
+
+    def register_release_batch(self, batch_id, entries):
+        """Register an immutable release batch in a single transaction.
+
+        Everything stateful happens under one ``BEGIN IMMEDIATE``
+        transaction:
+
+        * every named assessment must exist and be ``status == "ok"``;
+        * the exact immutable rule revision each assessment recorded is
+          read and locked inside the transaction (a named assessment whose
+          snapshot cannot be tied back to an existing immutable revision is
+          refused with ``rules-snapshot-unverifiable``; inline-rule
+          assessments carry their own pinned snapshot);
+        * each entry's declared artifacts/versions/dependencies are
+          verified against the assessment's pinned request, and the batch
+          is merged (shared components deduplicated; inconsistent name /
+          version / adopted license across assessments refuses the whole
+          batch with 422).
+
+        Only after every precondition holds are the manifest and the full
+        per-assessment rule snapshots written -- all in that same
+        transaction, so a failure writes no partial records.  Reusing a
+        ``batch_id`` with equal rebuilt content is idempotent (the frozen
+        manifest is returned); a reused id with different content fails
+        with 409 and never overwrites the registered snapshot.
+        """
+        from .batches import build_batch_manifest, verify_entry
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT manifest, batch_hash, created_at"
+                    " FROM release_batches WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+
+                ids = [e["assessment_id"] for e in entries]
+                placeholders = ",".join("?" for _ in ids)
+                found = {
+                    r["id"]: r
+                    for r in conn.execute(
+                        "SELECT id, ruleset, rules, revision, request, result"
+                        " FROM assessments WHERE id IN (%s)" % placeholders,
+                        ids,
+                    ).fetchall()
+                }
+                missing = sorted(aid for aid in ids if aid not in found)
+                if missing:
+                    raise ConflictError(
+                        "release batch references unknown assessment ids: %s"
+                        % ", ".join(missing),
+                        {"reason": "assessment-not-found", "assessment_ids": missing},
+                    )
+
+                items = []
+                for entry in sorted(entries, key=lambda e: e["assessment_id"]):
+                    aid = entry["assessment_id"]
+                    row = found[aid]
+                    request = json.loads(row["request"])
+                    result = json.loads(row["result"])
+                    status = result.get("status")
+                    if status != "ok":
+                        raise ConflictError(
+                            "assessment %r has status %r; only 'ok' assessments"
+                            " can be registered in a release batch"
+                            % (aid, status),
+                            {
+                                "reason": "assessment-not-ok",
+                                "assessment_id": aid,
+                                "status": status,
+                            },
+                        )
+
+                    rules = (
+                        json.loads(row["rules"]) if row["rules"] is not None else None
+                    )
+                    ruleset = row["ruleset"]
+                    revision = row["revision"]
+                    if rules is None:
+                        rules = self._snapshot_rules_within(conn, row)
+                        if rules is None:
+                            raise ConflictError(
+                                "assessment %r: the rule revision it was recorded"
+                                " against can no longer be verified" % aid,
+                                {
+                                    "reason": "rules-snapshot-unverifiable",
+                                    "assessment_id": aid,
+                                },
+                            )
+                    if ruleset:
+                        # Read and lock the immutable rule revision inside
+                        # this transaction; the pinned snapshot must be
+                        # byte-identical (same content hash) to that
+                        # revision's frozen body.
+                        rev = revision or revision_id(rules)
+                        rev_row = conn.execute(
+                            "SELECT body FROM ruleset_revisions"
+                            " WHERE ruleset_name = ? AND revision = ?",
+                            (ruleset, rev),
+                        ).fetchone()
+                        if rev_row is None or stable_hash(
+                            json.loads(rev_row["body"])
+                        ) != stable_hash(rules):
+                            raise ConflictError(
+                                "assessment %r: ruleset %r revision %r cannot be"
+                                " verified against an immutable revision"
+                                % (aid, ruleset, rev),
+                                {
+                                    "reason": "rules-snapshot-unverifiable",
+                                    "assessment_id": aid,
+                                    "ruleset": ruleset,
+                                    "revision": rev,
+                                },
+                            )
+                        revision = rev
+
+                    verify_entry(entry, request, result)
+                    items.append(
+                        {
+                            "entry": entry,
+                            "request": request,
+                            "result": result,
+                            "ruleset": ruleset,
+                            "revision": revision,
+                            "rules": rules,
+                        }
+                    )
+
+                manifest = build_batch_manifest(batch_id, items)
+
+                if existing is not None:
+                    if existing["batch_hash"] != manifest["batch_hash"]:
+                        raise ConflictError(
+                            "batch_id %r is already registered with different"
+                            " content" % batch_id,
+                            {
+                                "reason": "batch-id-conflict",
+                                "batch_id": batch_id,
+                                "existing_batch_hash": existing["batch_hash"],
+                                "requested_batch_hash": manifest["batch_hash"],
+                            },
+                        )
+                    conn.commit()
+                    return {
+                        "manifest": json.loads(existing["manifest"]),
+                        "created": False,
+                        "created_at": existing["created_at"],
+                    }
+
+                now = _now()
+                conn.execute(
+                    "INSERT INTO release_batches"
+                    "(batch_id, manifest, batch_hash, created, created_at)"
+                    " VALUES (?,?,?,?,?)",
+                    (
+                        batch_id,
+                        json.dumps(manifest, sort_keys=True),
+                        manifest["batch_hash"],
+                        1,
+                        now,
+                    ),
+                )
+                for seq, item in enumerate(
+                    sorted(items, key=lambda it: it["entry"]["assessment_id"])
+                ):
+                    conn.execute(
+                        "INSERT INTO release_batch_assessments"
+                        "(batch_id, assessment_id, ruleset, revision, rules, seq)"
+                        " VALUES (?,?,?,?,?,?)",
+                        (
+                            batch_id,
+                            item["entry"]["assessment_id"],
+                            item["ruleset"],
+                            item["revision"],
+                            json.dumps(item["rules"], sort_keys=True),
+                            seq,
+                        ),
+                    )
+                conn.commit()
+                return {"manifest": manifest, "created": True, "created_at": now}
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def get_release_batch(self, batch_id):
+        """Return the frozen manifest of a registered batch, else None.
+
+        The manifest is read verbatim from the registration row -- later
+        ruleset publications or assessment changes cannot alter it.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT manifest, created_at FROM release_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {"manifest": json.loads(row["manifest"]), "created_at": row["created_at"]}

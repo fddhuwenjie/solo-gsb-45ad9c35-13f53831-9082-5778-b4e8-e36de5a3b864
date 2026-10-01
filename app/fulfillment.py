@@ -31,11 +31,16 @@ The same material ``digest`` counts once; repeated digests whose metadata
 differs are rejected up front (HTTP 422).
 """
 
-from .common import ClientError, canonical, stable_hash
+from .common import ClientError, UnprocessableError, canonical, stable_hash
 
-
-class UnprocessableError(ValueError):
-    """The request is well-formed but semantically unusable (HTTP 422)."""
+# Re-exported for modules (and older callers) that import the 422 error
+# from the fulfillment package; the canonical definition lives in common.
+__all__ = [
+    "UnprocessableError",
+    "check_fulfillment",
+    "canonical",
+    "stable_hash",
+]
 
 
 # ---------------------------------------------------------------------------

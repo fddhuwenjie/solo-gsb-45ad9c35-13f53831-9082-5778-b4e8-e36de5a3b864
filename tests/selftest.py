@@ -414,6 +414,9 @@ def run_checks():
     # -- pre-publication impact review --------------------------------------
     run_impact_review_checks()
 
+    # -- immutable license release batches ----------------------------------
+    run_release_batch_checks()
+
     # -- WITH exception removes propagation ----------------------------------
     exc_request = {
         "components": [
@@ -3691,6 +3694,352 @@ def run_impact_review_checks():
     code, body = review([aid_ok, aid_missing, aid_conflict])
     check("impact: report identical after activation churn",
           code == 200 and body["report_hash"] == rep["report_hash"])
+
+
+def run_release_batch_checks():
+    """Exercise immutable release-batch registration end to end.
+
+    Two products share a component (app); the checks cover: the happy path
+    (dedup + union obligations/edges, stable manifest and batch_hash),
+    input-order invariance and hash stability, idempotent re-registration
+    with equal content and 409 on a reused batch_id with different content,
+    422s (unknown/incomplete artifacts, version/dependency mismatch,
+    duplicate artifacts, cross-assessment name/version/license mismatch),
+    400s (envelope), 409s (unknown/non-ok assessment, unverifiable
+    snapshot), GET 404, frozen snapshots after a later rule publication,
+    and a real concurrency race for a fresh batch_id.
+    """
+    def assess(spec, ruleset=None, expected="ok"):
+        body = dict(spec)
+        if ruleset:
+            body["ruleset"] = ruleset
+        code, out = call("POST", "/v1/assessments", body)
+        check("batch: assessment accepted (%s)" % spec.get("product"),
+              code == 200 and out.get("result", {}).get("status") == expected,
+              json.dumps(out)[:160])
+        return out
+
+    a1 = assess({
+        "product": "prod-1",
+        "components": [
+            {"id": "app", "name": "App", "version": "1.0.0", "license": "MIT"},
+            {"id": "liba", "name": "LibA", "version": "2.0",
+             "license": "Apache-2.0", "linkage": "dynamic"},
+            {"id": "libb", "name": "LibB", "version": "3.1",
+             "license": "ISC", "linkage": "static"},
+        ],
+        "dependencies": [
+            {"from": "app", "to": "liba"},
+            {"from": "app", "to": "libb"},
+        ],
+    })
+    a2 = assess({
+        "product": "prod-2",
+        "components": [
+            {"id": "app", "name": "App", "version": "1.0.0", "license": "MIT"},
+            {"id": "libc", "name": "LibC", "version": "0.9", "license": "MIT"},
+        ],
+        "dependencies": [{"from": "app", "to": "libc"}],
+    })
+    # third assessment: app at a different version (cross-batch mismatch)
+    a3 = assess({
+        "product": "prod-3",
+        "components": [
+            {"id": "app", "name": "App", "version": "2.0.0", "license": "MIT"},
+        ],
+    })
+    # fourth: same id/version/name but adopted license differs (mismatch)
+    a4 = assess({
+        "product": "prod-4",
+        "components": [
+            {"id": "app", "name": "App", "version": "1.0.0", "license": "ISC"},
+        ],
+    })
+    # a non-ok assessment
+    a_bad = assess({
+        "product": "prod-bad",
+        "components": [
+            {"id": "g1", "license": "GPL-2.0-only", "linkage": "static"},
+            {"id": "a1x", "license": "Apache-2.0", "linkage": "static"},
+        ],
+        "dependencies": [
+            {"from": "g1", "to": "a1x"},
+        ],
+    }, expected="conflict")
+
+    def entry(aid, arts):
+        return {"assessment_id": aid, "artifacts": arts}
+
+    e1 = entry(a1["id"], [
+        {"id": "app", "version": "1.0.0", "dependencies": ["liba", "libb"]},
+        {"id": "liba", "version": "2.0"},
+        {"id": "libb", "version": "3.1"},
+    ])
+    e2 = entry(a2["id"], [
+        {"id": "app", "version": "1.0.0", "dependencies": ["libc"]},
+        {"id": "libc", "version": "0.9"},
+    ])
+
+    def register(batch_id, entries):
+        return call("POST", "/v1/release-batches",
+                    {"batch_id": batch_id, "assessments": entries})
+
+    # -- happy path: dedup + union ------------------------------------------
+    code, body = register("REL-001", [e1, e2])
+    check("batch: register 200", code == 200 and body.get("created") is True,
+          json.dumps(body)[:200])
+    bh = body.get("batch_hash")
+    check("batch: 4 unique artifacts after dedup",
+          body.get("artifact_count") == 4
+          and {a["id"] for a in body.get("artifacts", [])}
+          == {"app", "liba", "libb", "libc"})
+    check("batch: assessment_count 2", body.get("assessment_count") == 2)
+    app_art = next(a for a in body["artifacts"] if a["id"] == "app")
+    check("batch: shared artifact dependencies unioned",
+          app_art["dependencies"] == ["liba", "libb", "libc"]
+          and app_art["assessments"] == sorted([a1["id"], a2["id"]]),
+          json.dumps(app_art))
+    check("batch: shared identity kept",
+          app_art["name"] == "App" and app_art["version"] == "1.0.0"
+          and app_art["license"] == "MIT")
+    check("batch: obligations merged on shared component",
+          app_art["obligations"] == ["attribution", "license-text"])
+    liba_art = next(a for a in body["artifacts"] if a["id"] == "liba")
+    check("batch: single-assessment artifact keeps obligations",
+          liba_art["obligations"] == ["attribution", "license-text", "notice-preserve"]
+          and liba_art["assessments"] == [a1["id"]])
+    entries_view = {e["assessment_id"]: e for e in body["assessments"]}
+    check("batch: assessments carry revision + artifacts",
+          set(entries_view) == {a1["id"], a2["id"]}
+          and entries_view[a1["id"]]["ruleset_revision"]
+          == a1.get("ruleset_revision")
+          and entries_view[a1["id"]]["artifacts"] == ["app", "liba", "libb"])
+    check("batch: hash is 64 hex",
+          isinstance(bh, str) and len(bh) == 64
+          and all(c in "0123456789abcdef" for c in bh))
+
+    # -- GET returns the frozen manifest ------------------------------------
+    code, got = call("GET", "/v1/release-batches/REL-001")
+    check("batch: GET 200 frozen manifest",
+          code == 200 and got.get("batch_hash") == bh
+          and got.get("artifacts") == body.get("artifacts"))
+    code, got = call("GET", "/v1/release-batches/REL-missing")
+    check("batch: GET unknown -> 404", code == 404)
+
+    # -- input order invariance: shuffled entries/artifacts/deps ------------
+    shuffled = [
+        entry(a2["id"], [
+            {"id": "libc", "version": "0.9"},
+            {"id": "app", "version": "1.0.0", "dependencies": ["libc"]},
+        ]),
+        entry(a1["id"], [
+            {"id": "libb", "version": "3.1"},
+            {"id": "app", "version": "1.0.0",
+             "dependencies": ["libb", "liba", "liba"]},
+            {"id": "liba", "version": "2.0"},
+        ]),
+    ]
+    code, body2 = register("REL-001-ordered", shuffled)
+    check("batch: input order does not change batch_hash",
+          code == 200 and body2.get("batch_hash") == bh
+          and body2.get("artifacts") == body.get("artifacts"))
+
+    # -- idempotency: same batch_id, same content ---------------------------
+    code, body3 = register("REL-001", [e2, e1])
+    check("batch: identical re-registration is idempotent",
+          code == 200 and body3.get("created") is False
+          and body3.get("batch_hash") == bh)
+
+    # -- same batch_id, different content -> 409 ----------------------------
+    code, body4 = register("REL-001", [e1])
+    check("batch: reused batch_id with other content -> 409",
+          code == 409 and body4.get("reason") == "batch-id-conflict"
+          and body4.get("existing_batch_hash") == bh
+          and body4.get("requested_batch_hash") != bh,
+          json.dumps(body4)[:200])
+    code, still = call("GET", "/v1/release-batches/REL-001")
+    check("batch: failed re-registration leaves snapshot intact",
+          code == 200 and still.get("batch_hash") == bh
+          and still.get("assessment_count") == 2)
+
+    # -- 422: declaration vs snapshot disagreements -------------------------
+    code, body = register("REL-u1", [entry(a1["id"], [
+        {"id": "app", "version": "1.0.0", "dependencies": ["liba", "libb"]},
+        {"id": "liba", "version": "2.0"},
+        {"id": "ghost", "version": "1.0"},
+    ])])
+    check("batch: unknown artifact -> 422",
+          code == 422 and body.get("reason") == "artifact-unknown"
+          and body.get("artifact_ids") == ["ghost"])
+
+    code, body = register("REL-u2", [entry(a1["id"], [
+        {"id": "app", "version": "1.0.0", "dependencies": ["liba", "libb"]},
+        {"id": "liba", "version": "2.0"},
+    ])])
+    check("batch: incomplete artifacts (libb missing) -> 422",
+          code == 422 and body.get("reason") == "artifact-incomplete"
+          and body.get("artifact_ids") == ["libb"])
+
+    code, body = register("REL-u3", [entry(a1["id"], [
+        {"id": "app", "version": "9.9.9", "dependencies": ["liba", "libb"]},
+        {"id": "liba", "version": "2.0"},
+        {"id": "libb", "version": "3.1"},
+    ])])
+    check("batch: version mismatch -> 422",
+          code == 422 and body.get("reason") == "artifact-version-mismatch"
+          and body.get("conflicts", [{}])[0].get("artifact_id") == "app")
+
+    code, body = register("REL-u4", [entry(a1["id"], [
+        {"id": "app", "version": "1.0.0", "dependencies": ["liba"]},
+        {"id": "liba", "version": "2.0"},
+        {"id": "libb", "version": "3.1"},
+    ])])
+    check("batch: dependency mismatch -> 422",
+          code == 422 and body.get("reason") == "artifact-dependency-mismatch")
+
+    code, body = register("REL-u5", [entry(a1["id"], [
+        {"id": "app", "version": "1.0.0", "dependencies": ["liba", "libb"]},
+        {"id": "liba", "version": "2.0"},
+        {"id": "liba", "version": "2.0"},
+        {"id": "libb", "version": "3.1"},
+    ])])
+    check("batch: duplicate artifact in one entry -> 422",
+          code == 422 and body.get("reason") == "duplicate-artifact")
+
+    code, body = register("REL-u6", [e1, entry(a3["id"], [
+        {"id": "app", "version": "2.0.0"},
+    ])])
+    check("batch: shared component version disagreement -> 422",
+          code == 422 and body.get("reason") == "component-mismatch"
+          and any(c.get("field") == "version" for c in body.get("conflicts", [])),
+          json.dumps(body)[:200])
+
+    code, body = register("REL-u7", [e1, entry(a4["id"], [
+        {"id": "app", "version": "1.0.0"},
+    ])])
+    check("batch: shared component license disagreement -> 422",
+          code == 422 and body.get("reason") == "component-mismatch"
+          and any(c.get("field") == "license" for c in body.get("conflicts", [])))
+
+    # -- 400: envelope errors ------------------------------------------------
+    for label, payload in (
+        ("non-object", []),
+        ("missing batch_id", {"assessments": [e1]}),
+        ("bad batch_id chars", {"batch_id": "bad id!", "assessments": [e1]}),
+        ("empty assessments", {"batch_id": "B", "assessments": []}),
+        ("51 entries", {"batch_id": "B", "assessments": [e1] * 51}),
+        ("duplicate assessment id", {"batch_id": "B", "assessments": [e1, e1]}),
+        ("empty artifacts",
+         {"batch_id": "B", "assessments": [entry(a1["id"], [])]}),
+        ("missing assessment_id",
+         {"batch_id": "B", "assessments": [{"artifacts": []}]}),
+    ):
+        code, body = call("POST", "/v1/release-batches", payload)
+        check("batch: %s -> 400" % label, code == 400, json.dumps(body)[:120])
+
+    # -- 409: unknown / non-ok assessments -----------------------------------
+    code, body = register("REL-x1", [entry("f" * 32, [{"id": "x", "version": "1"}])])
+    check("batch: unknown assessment -> 409",
+          code == 409 and body.get("reason") == "assessment-not-found"
+          and body.get("assessment_ids") == ["f" * 32])
+
+    code, body = register("REL-x2", [entry(a_bad["id"], [
+        {"id": "g1", "version": ""},
+        {"id": "a1x", "version": ""},
+    ])])
+    check("batch: non-ok assessment -> 409",
+          code == 409 and body.get("reason") == "assessment-not-ok"
+          and body.get("assessment_id") == a_bad["id"])
+
+    # -- immutability after a later rule publication -------------------------
+    rv1 = validate_ruleset(
+        {"licenses": {"P-1.0": {"obligations": ["attribution"]}}})
+    rv2 = validate_ruleset(
+        {"licenses": {"P-1.0": {"obligations": ["attribution", "license-text"]}}})
+    code, _ = call("PUT", "/v1/rulesets/batchrs", rv1)
+    check("batch: dedicated ruleset published", code == 200)
+    rev1 = call("GET", "/v1/rulesets/batchrs")[1]["active_revision"]
+    p1 = assess({"product": "p",
+                 "components": [{"id": "c", "name": "C", "version": "1",
+                                 "license": "P-1.0"}]},
+                ruleset="batchrs")
+    check("batch: assessment pinned to rev1",
+          p1.get("ruleset_revision") == rev1)
+    code, frozen = register("REL-frozen", [entry(p1["id"], [
+        {"id": "c", "version": "1"}])])
+    fhash = frozen["batch_hash"]
+    check("batch: frozen registration against rev1",
+          code == 200 and frozen["artifacts"][0]["obligations"]
+          == ["attribution"])
+    code, _ = call("PUT", "/v1/rulesets/batchrs", rv2)
+    check("batch: ruleset republished", code == 200)
+    rev2 = call("GET", "/v1/rulesets/batchrs")[1]["active_revision"]
+    check("batch: revision moved", rev2 != rev1)
+    code, again = register("REL-frozen", [entry(p1["id"], [
+        {"id": "c", "version": "1"}])])
+    check(
+        "batch: later rule publication does not change registered snapshot",
+        code == 200 and again.get("created") is False
+        and again.get("batch_hash") == fhash
+        and again["artifacts"][0]["obligations"] == ["attribution"]
+        and again["assessments"][0]["ruleset_revision"] == rev1,
+    )
+    p2 = assess({"product": "p2",
+                 "components": [{"id": "c", "name": "C", "version": "1",
+                                 "license": "P-1.0"}]},
+                ruleset="batchrs")
+    check("batch: new assessment pinned to rev2",
+          p2.get("ruleset_revision") == rev2)
+    code, mixed = register("REL-mixed", [
+        entry(p1["id"], [{"id": "c", "version": "1"}]),
+        entry(p2["id"], [{"id": "c", "version": "1"}]),
+    ])
+    revs = {e["ruleset_revision"] for e in mixed.get("assessments", [])}
+    check("batch: mixed revisions merge with per-row provenance",
+          code == 200 and revs == {rev1, rev2}
+          and mixed["artifacts"][0]["obligations"]
+          == ["attribution", "license-text"],
+          json.dumps(mixed)[:200])
+
+    # -- URL-safe batch id with colons/slashes survives the path ------------
+    safe_id = "release/2026/Q4:0001"
+    code, body = register(safe_id, [e1, e2])
+    check("batch: path-safe batch id accepted",
+          code == 200 and body.get("batch_hash") == bh)
+    code, body = call("GET", "/v1/release-batches/" + safe_id)
+    check("batch: path-safe batch id retrievable",
+          code == 200 and body.get("batch_hash") == bh)
+
+    # -- real concurrency: one batch_id, two different contents -------------
+    barrier = threading.Event()
+
+    def race_register(batch_id, entries, result_box):
+        barrier.wait()
+        result_box.append(call("POST", "/v1/release-batches",
+                               {"batch_id": batch_id, "assessments": entries}))
+
+    box1, box2 = [], []
+    t1 = threading.Thread(target=race_register, args=("REL-race", [e1, e2], box1))
+    t2 = threading.Thread(
+        target=race_register,
+        args=("REL-race",
+              [entry(p1["id"], [{"id": "c", "version": "1"}])], box2),
+    )
+    t1.start()
+    t2.start()
+    barrier.set()
+    t1.join()
+    t2.join()
+    codes = sorted((box1[0][0], box2[0][0]))
+    check("batch: concurrent registrations of one id: 200 + 409",
+          codes == [200, 409], str(codes))
+    winner = box1[0] if box1[0][0] == 200 else box2[0]
+    loser = box2[0] if box1[0][0] == 200 else box1[0]
+    check("batch: 409 loser reports batch-id-conflict",
+          loser[1].get("reason") == "batch-id-conflict")
+    code, stored = call("GET", "/v1/release-batches/REL-race")
+    check("batch: stored batch is the winner's content",
+          code == 200 and stored.get("batch_hash") == winner[1].get("batch_hash"))
 
 
 def run_legacy_migration_checks():

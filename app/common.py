@@ -31,6 +31,19 @@ class ConflictError(RuntimeError):
         self.details = dict(details) if details else None
 
 
+class UnprocessableError(ValueError):
+    """The request is well-formed but semantically unusable (HTTP 422).
+
+    Optional ``details`` are merged into the JSON error body so callers
+    can tell distinct failure kinds apart (a duplicate artifact versus an
+    inconsistent shared component, etc.).
+    """
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = dict(details) if details else None
+
+
 def canonical(obj):
     """Serialize to canonical JSON (sorted keys, tight separators)."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
