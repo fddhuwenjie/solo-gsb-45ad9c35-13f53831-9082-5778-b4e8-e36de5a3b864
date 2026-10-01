@@ -6,7 +6,9 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 
+from .batches import assemble_manifest, canonical_entries
 from .common import ConflictError, NotFound, stable_hash
+from .fulfillment import UnprocessableError
 from .revisions import revision_id
 from .solver import assess_normalized
 
@@ -14,7 +16,8 @@ from .solver import assess_normalized
 #   0 -- pre-revision databases (rulesets table + optional rules snapshot)
 #   2 -- immutable revisions: ruleset_revisions / ruleset_active /
 #        ruleset_activations and assessments.revision provenance
-SCHEMA_VERSION = 2
+#   3 -- immutable release batches: release_batches / release_batch_items
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rulesets (
@@ -61,6 +64,26 @@ CREATE TABLE IF NOT EXISTS confirmations (
     assessment_id TEXT PRIMARY KEY,
     body          TEXT NOT NULL,
     created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS release_batches (
+    batch_id     TEXT PRIMARY KEY,
+    manifest     TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    batch_hash   TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS release_batch_items (
+    batch_id      TEXT NOT NULL,
+    seq           INTEGER NOT NULL,
+    assessment_id TEXT NOT NULL,
+    artifact_id   TEXT NOT NULL,
+    version       TEXT NOT NULL,
+    dependencies  TEXT NOT NULL,
+    ruleset       TEXT,
+    revision      TEXT NOT NULL,
+    rules_hash    TEXT NOT NULL,
+    PRIMARY KEY (batch_id, seq),
+    FOREIGN KEY (batch_id) REFERENCES release_batches(batch_id)
 );
 """
 
@@ -883,3 +906,185 @@ class Store:
         finally:
             conn.close()
         return json.loads(row["body"]) if row else None
+
+    # -- immutable release batches ----------------------------------------
+
+    def register_release_batch(self, batch_id, entries):
+        """Register one immutable release batch inside a single transaction.
+
+        A ``BEGIN IMMEDIATE`` write transaction takes the SQLite write lock
+        for the whole operation, so the assessments, their pinned rules
+        snapshots and the ruleset revisions they record are read and
+        locked atomically with the batch insert -- a racing rules
+        publication or assessment write cannot interleave, and any failure
+        rolls the entire operation back (no partial batch is ever written).
+
+        Returns ``(manifest, created)``.  A repeated ``batch_id`` is
+        idempotent only when the submitted content is identical (entry
+        order independent); otherwise ConflictError.
+        """
+        request_hash = stable_hash(canonical_entries(entries))
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                existing = conn.execute(
+                    "SELECT manifest, request_hash FROM release_batches"
+                    " WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["request_hash"] == request_hash:
+                        return json.loads(existing["manifest"]), False
+                    raise ConflictError(
+                        "batch_id %r is already registered with different "
+                        "content" % batch_id,
+                        {
+                            "reason": "batch-id-reused",
+                            "batch_id": batch_id,
+                            "registered_batch_hash": json.loads(
+                                existing["manifest"]
+                            ).get("batch_hash"),
+                        },
+                    )
+
+                placeholders = ",".join("?" for _ in entries)
+                rows = {
+                    r["id"]: r
+                    for r in conn.execute(
+                        "SELECT id, ruleset, rules, revision, request, result"
+                        " FROM assessments WHERE id IN (%s)" % placeholders,
+                        [e["assessment_id"] for e in entries],
+                    ).fetchall()
+                }
+                missing = sorted(
+                    {
+                        e["assessment_id"]
+                        for e in entries
+                        if e["assessment_id"] not in rows
+                    }
+                )
+                if missing:
+                    raise ConflictError(
+                        "release batch references unknown assessment ids: %s"
+                        % ", ".join(missing),
+                        {"reason": "assessment-not-found", "assessment_ids": missing},
+                    )
+
+                loaded = []
+                provenance = {}
+                for e in entries:
+                    row = rows[e["assessment_id"]]
+                    result = json.loads(row["result"])
+                    if result.get("status") != "ok":
+                        raise ConflictError(
+                            "assessment %r has status %r; a release batch "
+                            "accepts only status 'ok' assessments"
+                            % (e["assessment_id"], result.get("status")),
+                            {
+                                "reason": "assessment-not-ok",
+                                "assessment_id": e["assessment_id"],
+                                "status": result.get("status"),
+                            },
+                        )
+                    # Only a snapshot pinned to a concrete, still-stored
+                    # immutable ruleset revision is releasable: inline-rule
+                    # rows have no revision, and a legacy row whose snapshot
+                    # could not be verified has no rules payload.  We never
+                    # re-evaluate against current rules -- later rule
+                    # publications must not change a registered snapshot.
+                    ruleset = row["ruleset"]
+                    revision = row["revision"]
+                    if not ruleset or not revision or row["rules"] is None:
+                        raise UnprocessableError(
+                            "assessment %r carries no verifiable rules snapshot "
+                            "pinned to an immutable ruleset revision; it cannot "
+                            "be registered in a release batch"
+                            % e["assessment_id"]
+                        )
+                    rules = json.loads(row["rules"])
+                    rules_hash = stable_hash(rules)
+                    rev_row = conn.execute(
+                        "SELECT body, content_hash FROM ruleset_revisions"
+                        " WHERE ruleset_name = ? AND revision = ?",
+                        (ruleset, revision),
+                    ).fetchone()
+                    if rev_row is None or rev_row["content_hash"] != rules_hash:
+                        raise UnprocessableError(
+                            "the rules snapshot of assessment %r cannot be "
+                            "verified against revision %r of ruleset %r"
+                            % (e["assessment_id"], revision, ruleset)
+                        )
+                    loaded.append((
+                        e,
+                        json.loads(row["request"]),
+                        result,
+                        {
+                            "assessment_id": e["assessment_id"],
+                            "ruleset": ruleset,
+                            "revision": revision,
+                            "rules_hash": rules_hash,
+                        },
+                    ))
+                    provenance[e["assessment_id"]] = (
+                        ruleset,
+                        revision,
+                        rules_hash,
+                    )
+
+                # Pure snapshot cross-checks and the cross-entry merge run
+                # inside the same locked transaction.
+                manifest = assemble_manifest(batch_id, loaded)
+
+                now = _now()
+                conn.execute(
+                    "INSERT INTO release_batches"
+                    "(batch_id, manifest, request_hash, batch_hash, created_at)"
+                    " VALUES (?,?,?,?,?)",
+                    (
+                        batch_id,
+                        json.dumps(manifest, sort_keys=True),
+                        request_hash,
+                        manifest["batch_hash"],
+                        now,
+                    ),
+                )
+                for seq, e in enumerate(entries):
+                    ruleset, revision, rules_hash = provenance[e["assessment_id"]]
+                    conn.execute(
+                        "INSERT INTO release_batch_items"
+                        "(batch_id, seq, assessment_id, artifact_id, version,"
+                        " dependencies, ruleset, revision, rules_hash)"
+                        " VALUES (?,?,?,?,?,?,?,?,?)",
+                        (
+                            batch_id,
+                            seq,
+                            e["assessment_id"],
+                            e["id"],
+                            e["version"],
+                            json.dumps(e["dependencies"], sort_keys=True),
+                            ruleset,
+                            revision,
+                            rules_hash,
+                        ),
+                    )
+                conn.commit()
+                return manifest, True
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def get_release_batch(self, batch_id):
+        """Return the immutable manifest of a registered batch, or None."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT manifest FROM release_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return json.loads(row["manifest"]) if row else None

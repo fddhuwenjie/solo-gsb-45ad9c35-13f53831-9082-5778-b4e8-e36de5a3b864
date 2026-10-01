@@ -28,7 +28,7 @@ python3 main.py
 数据持久化在 SQLite（容器内 `/data/app.db`，本地默认 `./data/app.db`，
 环境变量 `APP_DB` 可改）。
 
-自检（启动临时实例跑 434 项端到端检查）：
+自检（启动临时实例跑 476 项端到端检查）：
 
 ```bash
 python3 tests/selftest.py
@@ -55,6 +55,8 @@ python3 tests/selftest.py
 | POST | `/v1/assessments/{id}/responsibility-plan` | 义务责任分工（执行/复核） |
 | POST | `/v1/assessments/{id}/remediation-plan` | 冲突核算的组件许可证整改规划 |
 | POST | `/v1/assessments/compare` | 两次核算的原子差异与最小归因对比 |
+| POST | `/v1/release-batches` | 登记不可变许可证发布批次（内容一致时幂等） |
+| GET | `/v1/release-batches/{batch_id}` | 读取已登记批次清单 |
 
 ### 不可变修订与原子发布（含并发发布与回滚）
 
@@ -292,6 +294,147 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
 请求信封错误（非对象、缺少/非法 `base_revision`、`assessment_ids` 为空、
 超过 50 个、含重复或非字符串 ID）返回 **400**，与数据库状态无关。
 
+### 不可变许可证发布批次 `POST /v1/release-batches`
+
+把 **1～50 个** `status=ok` 的核算一次性登记为一个**不可变发布批次**。
+请求带唯一 `batch_id`，每个条目给出要发布制品的标识（该核算内的组件 id）、
+版本以及该制品在本次发布中声明的依赖：
+
+```json
+{
+  "batch_id": "release-2026-10-01",
+  "entries": [
+    {
+      "assessment_id": "57f32bf2b76ad1b91dcda8a52b8d5c73",
+      "id": "app-a",
+      "version": "1.0.0",
+      "dependencies": ["common"]
+    },
+    {
+      "assessment_id": "384f1a0e4f085cb0daa47c24ff98a2f7",
+      "id": "app-b",
+      "version": "0.9.0",
+      "dependencies": ["common"]
+    }
+  ]
+}
+```
+
+服务端在**同一个 SQLite 即时写事务**（`BEGIN IMMEDIATE`，整笔操作持有写锁）
+中读取并锁定每个核算及其记录的**不可变规则修订**，随后在该事务内完成合并与
+写入。任何一步失败都整体回滚，**绝不写入部分批次记录**：
+
+- 核算不存在 → **409** `reason: "assessment-not-found"`（附排序后的缺失
+  ID 列表）；核算状态不是 `ok` → **409** `reason: "assessment-not-ok"`；
+- 核算必须带有可核验的规则快照并绑定到一条**仍存在的不可变规则修订**
+  （内联规则核算、无法核验的旧行被拒绝），且快照哈希与修订内容一致；
+  快照无法核验 → **422**；
+- 条目制品不存在于该核算快照、版本与快照不一致、依赖不在快照中或依赖
+  自身 → **422**；
+- 同一批次重复发布同一制品 → **409** `reason: "duplicate-artifact"`
+  （同一请求内重复制品 id 在信封阶段即 **400**）；
+- 同一组件 id 出现在多个核算中时，其**名称、版本、采用许可证**必须完全
+  一致，否则 → **409** `reason: "component-conflict"`（附 `component`、
+  `field` 与相关 `assessments`）。
+
+前置条件全部满足时，对跨核算的共享组件（含作为依赖出现、自身不作为制品
+发布的组件）**去重合并**：制品清单按稳定 id 排序；每个制品带有其核算
+快照给出的采用许可证、依赖与制品级义务；顶层 `artifact_obligations` 为
+全部制品义务的**并集**；每个合并组件给出标识、名称、版本、采用许可证、
+以及**各核算组件义务的并集**（例如某义务在一种分发范围被门控掉、另一种
+范围保留时，并集保留该义务）与来源核算列表；`rule_revisions` 给出每个
+核算锁定的规则集、修订 id 与规则快照哈希。`batch_hash` 是规范化清单
+（不含哈希字段本身）的 SHA-256：**条目的提交顺序不影响清单内容与
+`batch_hash`**。
+
+```json
+{
+  "batch_id": "release-2026-10-01",
+  "artifact_obligations": [
+    "attribution", "license-text", "notice-preserve"
+  ],
+  "artifacts": [
+    {"id": "app-a", "name": "Service A", "version": "1.0.0",
+     "license": "MIT", "dependencies": ["common"],
+     "obligations": ["attribution", "license-text", "notice-preserve"],
+     "assessment_id": "57f32bf2…"},
+    {"id": "app-b", "name": "Service B", "version": "0.9.0",
+     "license": "ISC", "dependencies": ["common"],
+     "obligations": ["attribution", "license-text", "notice-preserve"],
+     "assessment_id": "384f1a0e…"}
+  ],
+  "components": [
+    {"id": "app-a", "name": "Service A", "version": "1.0.0",
+     "license": "MIT", "obligations": ["attribution", "license-text"],
+     "assessments": ["57f32bf2…"]},
+    {"id": "app-b", "name": "Service B", "version": "0.9.0",
+     "license": "ISC", "obligations": ["attribution", "license-text"],
+     "assessments": ["384f1a0e…"]},
+    {"id": "common", "name": "Common Kit", "version": "2.3.1",
+     "license": "Apache-2.0",
+     "obligations": ["attribution", "license-text", "notice-preserve"],
+     "assessments": ["384f1a0e…", "57f32bf2…"]}
+  ],
+  "rule_revisions": [
+    {"assessment_id": "384f1a0e…", "ruleset": "default",
+     "revision": "9f12d4f1324eaea3", "rules_hash": "9f12d4f1…（64 位）"},
+    {"assessment_id": "57f32bf2…", "ruleset": "default",
+     "revision": "9f12d4f1324eaea3", "rules_hash": "9f12d4f1…（64 位）"}
+  ],
+  "batch_hash": "b75b3f19…（64 位 SHA-256）",
+  "created": true
+}
+```
+
+**幂等与不可变性**：相同 `batch_id` 仅在提交内容一致（条目顺序无关）时
+幂等，返回 `"created": false` 与逐字节相同的清单/`batch_hash`；相同
+`batch_id` 携带不同内容 → **409** `reason: "batch-id-reused"`（附已登记
+清单的 `registered_batch_hash`）。批次只从核算持久化的规范化快照与其锁定
+的修订读取，**登记之后任何规则发布（新增/激活修订）都不会改变已登记
+清单与哈希**。可随时用 `GET /v1/release-batches/{batch_id}` 读取
+（未知 `batch_id` 返回 404；GET 响应不含 `created` 字段）。
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 先得到两个 status=ok 的核算（共享组件 common）
+A1=$(curl -sS -X POST "$BASE/v1/assessments" -H 'Content-Type: application/json' -d '{
+  "product": "svc-a", "distribution": "binary",
+  "components": [
+    {"id": "app-a", "name": "Service A", "version": "1.0.0", "license": "MIT"},
+    {"id": "common", "name": "Common Kit", "version": "2.3.1",
+     "license": "Apache-2.0", "linkage": "dynamic"}],
+  "dependencies": [{"from": "app-a", "to": "common"}]}')
+A2=$(curl -sS -X POST "$BASE/v1/assessments" -H 'Content-Type: application/json' -d '{
+  "product": "svc-b", "distribution": "binary",
+  "components": [
+    {"id": "app-b", "name": "Service B", "version": "0.9.0", "license": "ISC"},
+    {"id": "common", "name": "Common Kit", "version": "2.3.1",
+     "license": "Apache-2.0", "linkage": "dynamic"}],
+  "dependencies": [{"from": "app-b", "to": "common"}]}')
+ID1=$(echo "$A1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+ID2=$(echo "$A2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 2) 登记发布批次（共享组件去重、义务取并集）
+curl -sS -X POST "$BASE/v1/release-batches" \
+  -H 'Content-Type: application/json' \
+  -d "{\"batch_id\": \"release-2026-10-01\",
+       \"entries\": [
+         {\"assessment_id\": \"$ID1\", \"id\": \"app-a\",
+          \"version\": \"1.0.0\", \"dependencies\": [\"common\"]},
+         {\"assessment_id\": \"$ID2\", \"id\": \"app-b\",
+          \"version\": \"0.9.0\", \"dependencies\": [\"common\"]}
+       ]}"
+
+# 3) 相同内容（哪怕条目乱序）重放 -> 200 且 created=false、batch_hash 不变
+#    相同 batch_id 不同内容 -> 409
+curl -sS "$BASE/v1/release-batches/release-2026-10-01"
+```
+
+信封错误（非对象、`batch_id` 缺失/为空/超过 128 字符、`entries` 为空或
+超过 50 个、条目字段缺失或类型错误、同一请求内制品 id 或依赖重复）返回
+**400**，与数据库状态无关。
+
 **核算与活动修订**：命名规则集的核算（`POST /v1/assessments`）在单个
 事务内读取**事务开始时的活动修订**、按其规则快照求值，并把该修订 id
 记入评估记录（响应 `ruleset_revision`，`GET /v1/assessments/{id}` 的
@@ -303,7 +446,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
 **旧库迁移**：升级后首次打开旧版 SQLite 时，每个现有 `rulesets` 行
 （即旧 PUT 写入的内容）原样成为该规则集的**首个活动修订**（修订 id 为
 其内容哈希，`base_revision` 为 `null`），可核验的旧评估记录补盖修订
-id；旧 PUT/GET、既有评估快照与确认版语义全部保持不变。
+id；旧 PUT/GET、既有评估快照与确认版语义全部保持不变。发布批次使用的
+新表在同一迁移中以 `CREATE TABLE IF NOT EXISTS` 建立（`user_version`
+升至 3），旧库可直接打开。
 
 ### 提交核算 `POST /v1/assessments`
 
@@ -1084,15 +1229,16 @@ app/expression.py     SPDX 风格表达式解析（AND/OR/WITH）
 app/rules.py          默认规则集 + 规则校验规范化
 app/revisions.py      不可变修订标识：规范化内容哈希（修订 id / content_hash）
 app/review.py         发布前影响审查：批次信封校验、用目标修订不可变快照重算核算（旧/新状态、summary_hash、采用分支、义务差异、放行→冲突/错误汇总、report_hash）
+app/batches.py        不可变发布批次：批次信封校验（batch_id + 1～50 条目）、同事务快照核验与共享组件/制品去重合并（名称/版本/许可证一致校验、义务并集、rule_revisions、batch_hash）
 app/solver.py         义务传播、OR 分支选择（穷举 + 分支定界）、冲突检测、确认版生成
 app/fulfillment.py    履约材料核算：义务实例展开、all/any 证据规则（叶子命中按材料集合累积，可由多份材料共同满足）、全局最小集合选择（穷举 + 分支定界）
 app/schedule.py       义务截止日排期：RFC 3339/IANA 时区解析、日历日/工作日偏移、沿无环依赖反向收紧与收紧链还原
 app/responsibility.py 责任分工：责任项展开（制品级/组件级）、人员资格/容量/成本规范化、全局最优分工（穷举 + 最小费用流界的完备分支定界）、409 最佳部分方案与原因
 app/remediation.py   许可证整改：候选表达式/成本校验（非法整体 422）、在持久化快照上重算的全局最优异构组合（穷举 + 完备分支定界，精确有理数成本）、放行方案与 409 唯一最佳失败方案
 app/compare.py        核算对比：原子差异分解（稳定编号）、反事实回滚与全局最小归因集（按大小递增、ID 字典序完备枚举，非法中间状态不计命中）
-app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、影响审查的单读事务前置条件核验
+app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、影响审查的单读事务前置条件核验、发布批次的单写事务登记（锁定核算与规则修订、全成或全败、幂等）
 app/server.py         ThreadingHTTPServer JSON 路由
-tests/selftest.py     434 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查）
+tests/selftest.py     476 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次登记/幂等/合并冲突/快照不可变）
 Dockerfile / docker-compose.yml / .dockerignore
 ```
 

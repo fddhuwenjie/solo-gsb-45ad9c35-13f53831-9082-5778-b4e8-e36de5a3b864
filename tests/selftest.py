@@ -47,9 +47,10 @@ def call(method, path, obj=None):
 
 
 def main():
-    global BASE
+    global BASE, DB_PATH
     tmp = tempfile.mkdtemp(prefix="licapi-test-")
-    store = Store(os.path.join(tmp, "test.db"))
+    DB_PATH = os.path.join(tmp, "test.db")
+    store = Store(DB_PATH)
     store.put_ruleset("default", validate_ruleset(DEFAULT_RULESET))
     server = make_server("127.0.0.1", 0, store)
     BASE = "http://127.0.0.1:%d" % server.server_address[1]
@@ -413,6 +414,9 @@ def run_checks():
 
     # -- pre-publication impact review --------------------------------------
     run_impact_review_checks()
+
+    # -- immutable release batches ------------------------------------------
+    run_release_batch_checks()
 
     # -- WITH exception removes propagation ----------------------------------
     exc_request = {
@@ -3691,6 +3695,299 @@ def run_impact_review_checks():
     code, body = review([aid_ok, aid_missing, aid_conflict])
     check("impact: report identical after activation churn",
           code == 200 and body["report_hash"] == rep["report_hash"])
+
+
+def run_release_batch_checks():
+    """Exercise immutable release batch registration end to end.
+
+    A dedicated ruleset backs ok assessments that share one component
+    (deduplicated at merge time) and differ in distribution so the
+    merged obligation union is observable.  Checks cover: manifest
+    content/order, artifact and component dedup with merged obligation
+    unions, entry-order invariance of batch_hash, locked rule revision
+    provenance, idempotent re-registration (same content, any order),
+    409 batch_id reuse with different content, envelope 400s, 409s
+    (unknown/non-ok assessment, shared-component disagreement), 422s
+    (unverifiable inline snapshot, unknown artifact, version mismatch,
+    unknown/self dependency), no partial rows on failure, persistence of
+    the snapshot after a later rules publication, and GET of the batch.
+    """
+    rules = {
+        "licenses": {
+            "B-MIT": {"obligations": ["attribution", "license-text"]},
+            "B-GPL": {
+                "obligations": ["attribution", "license-text", "source-offer"],
+                "propagates": ["static"],
+            },
+            "B-ISC": {"obligations": ["attribution"]},
+        },
+        "obligation_scopes": {"source-offer": ["binary", "source"]},
+    }
+    code, body = call("PUT", "/v1/rulesets/relbatch", rules)
+    check("batch: ruleset published", code == 200 and body.get("created") is True)
+    r1 = call("GET", "/v1/rulesets/relbatch")[1]["active_revision"]
+
+    def assess(spec):
+        code, out = call("POST", "/v1/assessments",
+                         dict({"ruleset": "relbatch"}, **spec))
+        check("batch: assessment accepted (%s)" % spec["product"], code == 200,
+              json.dumps(out)[:160])
+        return out
+
+    a1 = assess({
+        "product": "prod-a", "distribution": "binary",
+        "components": [
+            {"id": "art-a", "name": "Artifact A", "version": "1.0.0",
+             "license": "B-MIT"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "B-GPL", "linkage": "dynamic"},
+        ],
+        "dependencies": [{"from": "art-a", "to": "common"}],
+    })
+    aid1 = a1["id"]
+    a2 = assess({
+        "product": "prod-b", "distribution": "saas",
+        "components": [
+            {"id": "art-b", "name": "Artifact B", "version": "0.9.0",
+             "license": "B-ISC"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "B-GPL", "linkage": "dynamic"},
+        ],
+        "dependencies": [{"from": "art-b", "to": "common"}],
+    })
+    aid2 = a2["id"]
+    # shared component whose name/version disagree -> merge conflict
+    a3 = assess({
+        "product": "prod-c",
+        "components": [
+            {"id": "art-c", "name": "Artifact C", "version": "5",
+             "license": "B-MIT"},
+            {"id": "common", "name": "Common Fork", "version": "9.9.9",
+             "license": "B-GPL", "linkage": "dynamic"},
+        ],
+    })
+    aid3 = a3["id"]
+    # an inline-rules assessment (no pinned revision) for rejection
+    code, inline = call("POST", "/v1/assessments", {
+        "components": [{"id": "inl", "name": "Inl", "version": "1",
+                        "license": "B-MIT"}],
+        "rules": {"licenses": {"B-MIT": {"obligations": ["attribution"]}}},
+    })
+    inline_id = inline["id"]
+    check("batch: inline assessment ok", code == 200
+          and inline["result"]["status"] == "ok")
+
+    def entry(aid, cid, ver, deps=None):
+        e = {"assessment_id": aid, "id": cid, "version": ver}
+        if deps is not None:
+            e["dependencies"] = deps
+        return e
+
+    def register(bid, entries):
+        return call("POST", "/v1/release-batches",
+                    {"batch_id": bid, "entries": entries})
+
+    # -- envelope 400s -------------------------------------------------------
+    code, _ = register("env", [])
+    check("batch: empty entries -> 400", code == 400)
+    code, _ = register("env", [
+        {"assessment_id": "x", "id": "i%d" % i, "version": "1"}
+        for i in range(51)
+    ])
+    check("batch: 51 entries -> 400", code == 400)
+    for bad in [
+        {"entries": [entry(aid1, "art-a", "1.0.0")]},  # missing batch_id
+        {"batch_id": "", "entries": [entry(aid1, "art-a", "1.0.0")]},
+        {"batch_id": 17, "entries": [entry(aid1, "art-a", "1.0.0")]},
+        {"batch_id": "env", "entries": "nope"},
+        {"batch_id": "env", "entries": [{"id": "x", "version": "1"}]},
+        {"batch_id": "env", "entries": [entry(aid1, "art-a", "")]},
+        {"batch_id": "env", "entries": [entry(aid1, "art-a", "1", deps=["x", "x"])]},
+        {"batch_id": "env", "entries": [entry(aid1, "art-a", "1"),
+                                        entry(aid2, "art-a", "0.9.0")]},
+        ["not", "an", "object"],
+    ]:
+        code, b = call("POST", "/v1/release-batches", bad)
+        check("batch: envelope rejection -> 400 (%r)" % json.dumps(bad)[:60],
+              code == 400)
+
+    # -- happy path ----------------------------------------------------------
+    entries = [
+        entry(aid1, "art-a", "1.0.0", ["common"]),
+        entry(aid2, "art-b", "0.9.0", ["common"]),
+    ]
+    code, batch = register("rel-001", entries)
+    check("batch: register 200 created", code == 200 and batch.get("created") is True,
+          json.dumps(batch)[:200])
+    check("batch: artifacts merged, sorted by id",
+          [a["id"] for a in batch.get("artifacts", [])] == ["art-a", "art-b"])
+    arts = {a["id"]: a for a in batch["artifacts"]}
+    check(
+        "batch: artifact identity/version/license/deps pinned",
+        arts["art-a"]["version"] == "1.0.0"
+        and arts["art-a"]["license"] == "B-MIT"
+        and arts["art-a"]["dependencies"] == ["common"]
+        and arts["art-a"]["assessment_id"] == aid1
+        and arts["art-b"]["license"] == "B-ISC"
+        and arts["art-b"]["assessment_id"] == aid2,
+    )
+    comps = {c["id"]: c for c in batch.get("components", [])}
+    check(
+        "batch: shared component deduplicated once",
+        sorted(comps) == ["art-a", "art-b", "common"]
+        and comps["common"]["assessments"] == sorted([aid1, aid2])
+        and comps["common"]["version"] == "2.3.1"
+        and comps["common"]["license"] == "B-GPL",
+    )
+    # common is B-GPL (source-offer gated out under saas in assessment 2):
+    # the union over both assessments restores the binary-scope obligation.
+    check(
+        "batch: component obligations merged (union across assessments)",
+        comps["common"]["obligations"]
+        == ["attribution", "license-text", "source-offer"],
+        str(comps["common"]["obligations"]),
+    )
+    check("batch: batch_hash is sha256",
+          len(batch.get("batch_hash", "")) == 64)
+    check(
+        "batch: per-artifact and union artifact obligations",
+        arts["art-a"]["obligations"]
+        == ["attribution", "license-text", "source-offer"]
+        and arts["art-b"]["obligations"] == ["attribution", "license-text"]
+        and batch.get("artifact_obligations")
+        == ["attribution", "license-text", "source-offer"],
+        str((arts["art-a"].get("obligations"), arts["art-b"].get("obligations"),
+             batch.get("artifact_obligations"))),
+    )
+    revs = {(r["assessment_id"]): r for r in batch.get("rule_revisions", [])}
+    check(
+        "batch: locked rule revisions recorded",
+        set(revs) == {aid1, aid2}
+        and all(r["ruleset"] == "relbatch" and r["revision"] == r1
+                and len(r["rules_hash"]) == 64 for r in revs.values()),
+        str(batch.get("rule_revisions")),
+    )
+
+    # -- order invariance + idempotency --------------------------------------
+    code, batch_rev = register("rel-001", list(reversed(entries)))
+    check(
+        "batch: same content, reversed entries -> idempotent, same hash",
+        code == 200 and batch_rev.get("created") is False
+        and batch_rev["batch_hash"] == batch["batch_hash"]
+        and batch_rev["artifacts"] == batch["artifacts"]
+        and batch_rev["components"] == batch["components"],
+    )
+    code, b = register("rel-001", [entry(aid1, "art-a", "1.0.0", ["common"])])
+    check("batch: same batch_id, different content -> 409",
+          code == 409 and b.get("reason") == "batch-id-reused"
+          and b.get("registered_batch_hash") == batch["batch_hash"])
+
+    # -- GET -----------------------------------------------------------------
+    code, got = call("GET", "/v1/release-batches/rel-001")
+    check("batch: GET returns the immutable manifest",
+          code == 200 and got.get("batch_hash") == batch["batch_hash"]
+          and "created" not in got)
+    code, b = call("GET", "/v1/release-batches/no-such-batch")
+    check("batch: GET unknown -> 404", code == 404)
+
+    # -- stateful rejections --------------------------------------------------
+    code, b = register("rel-missing",
+                       [entry("deadbeef" * 4, "x", "1")])
+    check("batch: unknown assessment -> 409",
+          code == 409 and b.get("reason") == "assessment-not-found"
+          and b.get("assessment_ids") == ["deadbeef" * 4])
+    code, b = register("rel-conflict",
+                       [entry(aid1, "art-a", "1.0.0"),
+                        entry(aid3, "art-c", "5")])
+    check("batch: shared component disagreement -> 409",
+          code == 409 and b.get("reason") == "component-conflict"
+          and b.get("component") == "common" and b.get("field") in
+          ("name", "version"))
+    code, b = register("rel-inline", [entry(inline_id, "inl", "1")])
+    check("batch: unverifiable inline snapshot -> 422", code == 422)
+    code, b = register("rel-no-art", [entry(aid1, "ghost", "1")])
+    check("batch: artifact not in snapshot -> 422", code == 422)
+    code, b = register("rel-bad-ver",
+                       [entry(aid1, "art-a", "9.9.9")])
+    check("batch: version mismatch -> 422", code == 422)
+    code, b = register("rel-bad-dep",
+                       [entry(aid1, "art-a", "1.0.0", ["nope"])])
+    check("batch: unknown dependency -> 422", code == 422)
+    code, b = register("rel-self-dep",
+                       [entry(aid1, "art-a", "1.0.0", ["art-a"])])
+    check("batch: self dependency -> 422", code == 422)
+
+    # one assessment may publish several artifacts (dependency as artifact)
+    code, b = register("rel-multi", [
+        entry(aid1, "art-a", "1.0.0", ["common"]),
+        entry(aid1, "common", "2.3.1", []),
+    ])
+    check(
+        "batch: multiple artifacts from one assessment merged",
+        code == 200 and [a["id"] for a in b["artifacts"]] == ["art-a", "common"]
+        and {c["id"]: c["assessments"] for c in b["components"]}["common"]
+        == [aid1]
+        and len(b["rule_revisions"]) == 1,
+        json.dumps(b)[:200],
+    )
+
+    # -- non-ok assessment: publish an incompatible revision first -----------
+    v2 = {
+        "licenses": dict(
+            rules["licenses"],
+            **{"B-MIT": {
+                "obligations": ["attribution", "license-text"],
+                "incompatible_with": ["B-GPL"],
+            }},
+        ),
+        "obligation_scopes": rules["obligation_scopes"],
+    }
+    code, rev = call("POST", "/v1/rulesets/relbatch/revisions",
+                     {"rules": v2, "base_revision": r1})
+    r2 = rev.get("revision")
+    code, _ = call("POST", "/v1/rulesets/relbatch/revisions/%s/activate" % r2,
+                   {"expected_active_revision": r1})
+    check("batch: incompatible revision published", code == 200)
+    # the pre-existing assessment, re-submitted now, records r2 and conflicts
+    ac2 = assess({
+        "product": "prod-conflict",
+        "components": [
+            {"id": "gpl", "license": "B-GPL", "linkage": "static"},
+            {"id": "mit", "license": "B-MIT", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "gpl", "to": "mit"}],
+    })
+    check("batch: new assessment against r2 is conflict",
+          ac2["result"]["status"] == "conflict"
+          and ac2.get("ruleset_revision") == r2)
+    code, b = register("rel-not-ok", [entry(ac2["id"], "gpl", "1")])
+    check("batch: non-ok assessment -> 409",
+          code == 409 and b.get("reason") == "assessment-not-ok"
+          and b.get("status") == "conflict")
+
+    # -- later rule publication must not change the registered snapshot -------
+    code, got = call("GET", "/v1/release-batches/rel-001")
+    check(
+        "batch: registered snapshot immutable after later publication",
+        code == 200
+        and got["batch_hash"] == batch["batch_hash"]
+        and {r["revision"] for r in got["rule_revisions"]} == {r1}
+        and got["components"] == batch["components"],
+    )
+
+    # -- no partial writes: only the one successful batch is stored ----------
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        stored = sorted(r[0] for r in conn.execute(
+            "SELECT batch_id FROM release_batches"))
+        counts = dict(conn.execute(
+            "SELECT batch_id, COUNT(*) FROM release_batch_items GROUP BY batch_id"))
+    finally:
+        conn.close()
+    check("batch: failed registrations wrote no rows",
+          stored == ["rel-001", "rel-multi"]
+          and counts == {"rel-001": 2, "rel-multi": 2},
+          "%s %s" % (stored, counts))
 
 
 def run_legacy_migration_checks():

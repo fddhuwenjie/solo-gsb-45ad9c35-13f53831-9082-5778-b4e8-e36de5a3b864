@@ -19,6 +19,8 @@ Endpoints:
     POST /v1/assessments/{id}/responsibility-plan
     POST /v1/assessments/{id}/remediation-plan
     POST /v1/assessments/compare
+    POST /v1/release-batches
+    GET  /v1/release-batches/{batch_id}
 """
 
 import json
@@ -28,6 +30,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+from .batches import validate_batch_body
 from .common import ClientError, ConflictError, NotFound, stable_hash
 from .compare import compare_assessments
 from .fulfillment import UnprocessableError, check_fulfillment
@@ -50,6 +53,7 @@ _ASSESS_RE = re.compile(
     r"(/(?:confirm|confirmation|fulfillment-check|obligation-schedule"
     r"|responsibility-plan|remediation-plan))?)?$"
 )
+_BATCH_RE = re.compile(r"^/v1/release-batches(?:/([A-Za-z0-9._-]{1,128}))?$")
 
 
 class Api:
@@ -352,6 +356,21 @@ class Api:
             raise ConflictError("cannot compare assessment %r: %s" % (aid, reason))
         return row
 
+    # -- immutable release batches ----------------------------------------
+
+    def register_release_batch(self, body):
+        batch_id, entries = validate_batch_body(body)
+        manifest, created = self.store.register_release_batch(batch_id, entries)
+        out = dict(manifest)
+        out["created"] = created
+        return out
+
+    def get_release_batch(self, batch_id):
+        manifest = self.store.get_release_batch(batch_id)
+        if manifest is None:
+            raise NotFound("release batch %r not found" % batch_id)
+        return manifest
+
 
 def make_server(host, port, store):
     api = Api(store)
@@ -428,12 +447,21 @@ def make_server(host, port, store):
                                 "POST /v1/assessments/{id}/responsibility-plan",
                                 "POST /v1/assessments/{id}/remediation-plan",
                                 "POST /v1/assessments/compare",
+                                "POST /v1/release-batches",
+                                "GET  /v1/release-batches/{batch_id}",
                             ],
                         },
                     )
 
                 if method == "POST" and path == "/v1/assessments/compare":
                     return self._json(200, api.compare(self._body()))
+
+                if method == "POST" and path == "/v1/release-batches":
+                    return self._json(200, api.register_release_batch(self._body()))
+
+                m = _BATCH_RE.match(path)
+                if m and method == "GET" and m.group(1) is not None:
+                    return self._json(200, api.get_release_batch(m.group(1)))
 
                 m = _REVISION_RE.match(path)
                 if m:
